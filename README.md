@@ -17,5 +17,6 @@ A desktop chess application and AI engine built from scratch in Python using Kiv
 ├── main.py              # Chess rules engine, Alpha-Beta AI, and Kivy GUI
 ├── images/              # Optional PNG piece sprites (e.g., white-king.png)
 ├── requirements.txt     # Python dependencies
+├── chessgame.csv        # CSV file, saves game information
 ├── LICENSE              # MIT License
 └── .gitignore           # Excludes virtual environments, caches, and local CSV logs
