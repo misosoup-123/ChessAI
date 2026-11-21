@@ -44,7 +44,7 @@ The codebase is decoupled into two distinct layers inside `main.py`:
 * **Auxiliary State:** Castling availability (`self.castling_rights`) and en-passant vulnerability (`self.en_passant_target`) are tracked explicitly alongside `self.move_history`.
 
 ### Zero-Allocation Search (`apply_move` / `undo_move`)
-Cloning an $8 \times 8$ nested dictionary via `copy.deepcopy()` at every node of a depth-4 game tree introduces heavy garbage-collection overhead. Instead, `ChessGame` mutates `self.board` in place and returns a compact `undo` snapshot:
+Cloning an $8 \times 8$ nested dictionary via `copy.deepcopy()` at every node of a depth-5 game tree introduces heavy garbage-collection overhead. Instead, `ChessGame` mutates `self.board` in place and returns a compact `undo` snapshot:
 
 ```python
 undo = {
@@ -80,7 +80,7 @@ Every candidate move is passed through `is_valid_move()`, which temporarily exec
 
 ## 4. Search Algorithm (`minimax` & `score_move`)
 
-The AI plays Black using a depth-4 Minimax search with **Alpha-Beta pruning** and **MVV-LVA move ordering**.
+The AI plays Black using a depth-5 Minimax search with **Alpha-Beta pruning** and **MVV-LVA move ordering**.
 
 ### MVV-LVA Move Ordering (`score_move`)
 Alpha-Beta pruning achieves maximum branch cutoffs when strong moves are evaluated first. Before iterating through `legal_moves`, the engine sorts candidates descending by heuristic priority:
@@ -112,6 +112,6 @@ Leaf nodes at `depth == 0` are scored from White's perspective (positive favours
 
 ## 6. Concurrency & Kivy UI Lifecycle
 
-* **Non-Blocking AI Execution (`ai_turn`):** Running a depth-4 tree search directly on Kivy's main loop would block frame rendering and trigger OS unresponsive-window warnings. When Black's turn begins, `GameScreen` locks board input (`self.ai_thinking = True`) and spawns a daemon `threading.Thread` to execute `self.game.ai_move(depth=4)`. Once complete, `Clock.schedule_once` schedules `_finish_ai_turn()` back on the main thread to safely mutate Kivy UI textures and timers.
+* **Non-Blocking AI Execution (`ai_turn`):** Running a depth-4 tree search directly on Kivy's main loop would block frame rendering and trigger OS unresponsive-window warnings. When Black's turn begins, `GameScreen` locks board input (`self.ai_thinking = True`) and spawns a daemon `threading.Thread` to execute `self.game.ai_move(depth=5)`. Once complete, `Clock.schedule_once` schedules `_finish_ai_turn()` back on the main thread to safely mutate Kivy UI textures and timers.
 * **Texture-Safe Move History (`update_move_history`):** Rather than concatenating an entire game into a single giant `Label` (which can exceed OpenGL `GL_MAX_TEXTURE_SIZE` limits on long matches), each full move pair (`1. e4   e5`) is rendered as a fixed-height row inside a width-bound `GridLayout` within a `ScrollView`.
 * **Telemetry Logging (`save_game_record`):** Upon checkmate, stalemate, timeout, or resignation, match metadata—including ISO-8601 UTC timestamp, player names, time control, Fischer increment, remaining clock times, and pipe-delimited algebraic moves—is appended to `chessgame.csv`.
