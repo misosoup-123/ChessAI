@@ -1,6 +1,6 @@
 # Minimax Chess Engine & Kivy GUI
 
-A desktop chess application and AI engine built from scratch in Python using Kivy. It enforces full FIDE rules, supports configurable Fischer time controls, and features a depth-4 Alpha-Beta search engine running asynchronously so the GUI remains responsive during search.
+A desktop chess application and AI engine built from scratch in Python using Kivy. It enforces full FIDE rules, supports configurable Fischer time controls, and features a depth-5 Alpha-Beta search engine running asynchronously so the GUI remains responsive during search.
 
 ## Technical Highlights
 
