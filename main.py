@@ -554,7 +554,7 @@ class ChessGame:
         self.undo_move(undo)
         self.current_player = self.opponent(self.current_player)
 
-    def ai_move(self, depth=4):
+    def ai_move(self, depth=5):
         """Select and execute the best move for Black via Minimax search."""
         if self.current_player != 'black':
             return False
@@ -969,7 +969,7 @@ class GameScreen(Screen):
             return
 
         def worker():
-            moved = self.game.ai_move(depth=4)
+            moved = self.game.ai_move(depth=5)
             # Marshal UI updates back onto Kivy's main thread
             Clock.schedule_once(lambda _dt: self._finish_ai_turn(moved), 0)
 
