@@ -1,0 +1,1188 @@
+import kivy
+from kivy.app import App
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+from kivy.uix.textinput import TextInput
+from kivy.uix.popup import Popup
+from kivy.uix.widget import Widget
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.screenmanager import ScreenManager, Screen
+from kivy.clock import Clock
+from kivy.core.window import Window
+import os
+import re
+import csv
+import math
+import threading
+from datetime import datetime, timezone
+
+Window.size = (1200, 800)
+
+# Resolve asset and CSV log paths relative to this script's directory
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+IMAGE_DIR = os.path.join(BASE_DIR, 'images')
+
+MATE_SCORE = 100000
+
+# Exponential decay parameters for centre-pawn bonus: B(n) = B0 * exp(-k * n)
+CENTRE_PAWN_B0 = 0.6
+CENTRE_PAWN_K = 0.25
+
+# Weight central 2x2 squares at 1.0 and the surrounding 4x4 ring at 0.4
+CENTRE_WEIGHTS = {
+    (r, c): (1.0 if (r in (3, 4) and c in (3, 4)) else 0.4)
+    for r in range(2, 6)
+    for c in range(2, 6)
+}
+
+# Map rook starting squares to the castling rights they invalidate
+CORNER_RIGHTS = {
+    (7, 0): ('white', 'queenside'),
+    (7, 7): ('white', 'kingside'),
+    (0, 0): ('black', 'queenside'),
+    (0, 7): ('black', 'kingside'),
+}
+
+
+class ChessGame:
+    """Core chess rules engine, board state manager, and Alpha-Beta search AI."""
+
+    PIECE_LETTERS = {'pawn': '', 'rook': 'R', 'knight': 'N', 'bishop': 'B', 'queen': 'Q', 'king': 'K'}
+    PIECE_VALUES = {'pawn': 1, 'knight': 3, 'bishop': 3, 'rook': 5, 'queen': 9, 'king': 1000}
+    KNIGHT_OFFSETS = [(-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1)]
+    KING_OFFSETS = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1), (0, -2), (0, 2)]
+    ROOK_DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    BISHOP_DIRS = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
+
+    def __init__(self, game_screen=None):
+        """Initialise a fresh chess match and board state."""
+        self.game_screen = game_screen
+        self.board = self.create_initial_board()
+        self.current_player = 'white'
+        self.move_history = []
+        self.game_over = False
+        self.winner = None
+        self.end_reason = None
+        self.in_check = False
+        self.castling_rights = {
+            'white': {'kingside': True, 'queenside': True},
+            'black': {'kingside': True, 'queenside': True}
+        }
+        self.en_passant_target = None
+        self.root_depth = 0
+
+    def create_initial_board(self):
+        """Build and return the starting 8x8 piece matrix."""
+        board = [[None for _ in range(8)] for _ in range(8)]
+        pieces_order = ['rook', 'knight', 'bishop', 'queen', 'king', 'bishop', 'knight', 'rook']
+        for col, piece in enumerate(pieces_order):
+            board[0][col] = {'piece': piece, 'colour': 'black'}
+            board[7][col] = {'piece': piece, 'colour': 'white'}
+        for col in range(8):
+            board[1][col] = {'piece': 'pawn', 'colour': 'black'}
+            board[6][col] = {'piece': 'pawn', 'colour': 'white'}
+        return board
+
+    def get_piece_at(self, row, col):
+        """Return the piece dict at (row, col), or None if empty or out of bounds."""
+        if 0 <= row < 8 and 0 <= col < 8:
+            return self.board[row][col]
+        return None
+
+    @staticmethod
+    def opponent(colour):
+        """Return the opposing side's colour string."""
+        return 'black' if colour == 'white' else 'white'
+
+    def is_valid_move(self, from_row, from_col, to_row, to_col):
+        """Verify ownership, geometry, path clearance, and king safety for a move."""
+        piece = self.get_piece_at(from_row, from_col)
+        if not piece or piece['colour'] != self.current_player:
+            return False
+        if not (0 <= to_row < 8 and 0 <= to_col < 8):
+            return False
+        target = self.get_piece_at(to_row, to_col)
+        if target and target['colour'] == piece['colour']:
+            return False
+        if not self.is_valid_piece_move(piece['piece'], from_row, from_col, to_row, to_col):
+            return False
+        # Reject moves that leave or place the moving player's king in check
+        if self.would_be_in_check_after_move(from_row, from_col, to_row, to_col):
+            return False
+        return True
+
+    def is_valid_piece_move(self, piece_type, from_row, from_col, to_row, to_col):
+        """Route movement geometry validation to the appropriate piece handler."""
+        row_diff = to_row - from_row
+        col_diff = to_col - from_col
+        if piece_type == 'pawn':
+            return self.is_valid_pawn_move(from_row, from_col, to_row, to_col)
+        elif piece_type == 'rook':
+            return self.is_valid_rook_move(from_row, from_col, to_row, to_col)
+        elif piece_type == 'knight':
+            return (abs(row_diff) == 2 and abs(col_diff) == 1) or (abs(row_diff) == 1 and abs(col_diff) == 2)
+        elif piece_type == 'bishop':
+            return self.is_valid_bishop_move(from_row, from_col, to_row, to_col)
+        elif piece_type == 'queen':
+            return (self.is_valid_rook_move(from_row, from_col, to_row, to_col) or
+                    self.is_valid_bishop_move(from_row, from_col, to_row, to_col))
+        elif piece_type == 'king':
+            return self.is_valid_king_move(from_row, from_col, to_row, to_col)
+        return False
+
+    def is_valid_king_move(self, from_row, from_col, to_row, to_col):
+        """Validate single-square king steps and kingside/queenside castling."""
+        col_diff = to_col - from_col
+        row_diff = to_row - from_row
+        if abs(col_diff) <= 1 and abs(row_diff) <= 1:
+            return True
+        if row_diff != 0 or abs(col_diff) != 2:
+            return False
+
+        king = self.get_piece_at(from_row, from_col)
+        if not king:
+            return False
+        colour = king['colour']
+        home_row = 7 if colour == 'white' else 0
+        if from_row != home_row or from_col != 4:
+            return False
+
+        # Cannot castle while currently in check
+        if self.is_square_attacked(from_row, from_col, self.opponent(colour)):
+            return False
+
+        # Verify empty path, unattacked transit squares, and unmoved rook
+        if self.castling_rights[colour]['kingside'] and col_diff == 2:
+            rook = self.get_piece_at(from_row, from_col + 3)
+            if (self.get_piece_at(from_row, from_col + 1) is None and
+                    self.get_piece_at(from_row, from_col + 2) is None and
+                    not self.would_be_in_check_after_move(from_row, from_col, from_row, from_col + 1) and
+                    not self.would_be_in_check_after_move(from_row, from_col, to_row, to_col) and
+                    rook is not None and rook.get('piece') == 'rook' and rook.get('colour') == colour):
+                return True
+
+        if self.castling_rights[colour]['queenside'] and col_diff == -2:
+            rook = self.get_piece_at(from_row, from_col - 4)
+            if (self.get_piece_at(from_row, from_col - 1) is None and
+                    self.get_piece_at(from_row, from_col - 2) is None and
+                    self.get_piece_at(from_row, from_col - 3) is None and
+                    not self.would_be_in_check_after_move(from_row, from_col, from_row, from_col - 1) and
+                    not self.would_be_in_check_after_move(from_row, from_col, to_row, to_col) and
+                    rook is not None and rook.get('piece') == 'rook' and rook.get('colour') == colour):
+                return True
+        return False
+
+    def is_valid_pawn_move(self, from_row, from_col, to_row, to_col):
+        """Validate forward pawn pushes, diagonal captures, and en-passant."""
+        piece = self.get_piece_at(from_row, from_col)
+        target = self.get_piece_at(to_row, to_col)
+        direction = -1 if piece['colour'] == 'white' else 1
+        row_diff = to_row - from_row
+        col_diff = abs(to_col - from_col)
+
+        if col_diff == 0:
+            if row_diff == direction and not target:
+                return True
+            # Two-square advance from starting rank requires both squares clear
+            if ((piece['colour'] == 'white' and from_row == 6) or
+                    (piece['colour'] == 'black' and from_row == 1)):
+                if (row_diff == 2 * direction and not target and
+                        self.get_piece_at(from_row + direction, from_col) is None):
+                    return True
+        elif col_diff == 1 and row_diff == direction:
+            if target and target['colour'] != piece['colour']:
+                return True
+            elif target is None and (to_row, to_col) == self.en_passant_target:
+                return True
+        return False
+
+    def is_valid_rook_move(self, from_row, from_col, to_row, to_col):
+        """Validate orthogonal rook movement and line-of-sight clearance."""
+        if from_row != to_row and from_col != to_col:
+            return False
+        return self.is_path_clear(from_row, from_col, to_row, to_col)
+
+    def is_valid_bishop_move(self, from_row, from_col, to_row, to_col):
+        """Validate diagonal bishop movement and line-of-sight clearance."""
+        if abs(to_row - from_row) != abs(to_col - from_col):
+            return False
+        return self.is_path_clear(from_row, from_col, to_row, to_col)
+
+    def is_path_clear(self, from_row, from_col, to_row, to_col):
+        """Step along a ray from source to destination and return False if blocked."""
+        row_step = 0 if from_row == to_row else (1 if to_row > from_row else -1)
+        col_step = 0 if from_col == to_col else (1 if to_col > from_col else -1)
+        current_row, current_col = from_row + row_step, from_col + col_step
+        while current_row != to_row or current_col != to_col:
+            if self.get_piece_at(current_row, current_col):
+                return False
+            current_row += row_step
+            current_col += col_step
+        return True
+
+    def would_be_in_check_after_move(self, from_row, from_col, to_row, to_col):
+        """Simulate a move in-place to test if the mover's king becomes exposed."""
+        piece = self.board[from_row][from_col]
+        colour = piece['colour']
+        captured = self.board[to_row][to_col]
+        ep_square = None
+        ep_piece = None
+
+        # Temporarily remove captured en-passant pawn on the adjacent file
+        if (piece['piece'] == 'pawn' and from_col != to_col and captured is None
+                and (to_row, to_col) == self.en_passant_target):
+            ep_square = (from_row, to_col)
+            ep_piece = self.board[from_row][to_col]
+            self.board[from_row][to_col] = None
+
+        self.board[to_row][to_col] = piece
+        self.board[from_row][from_col] = None
+        king_row, king_col = self.find_king(colour)
+        in_check = False
+        if king_row is not None:
+            in_check = self.is_square_attacked(king_row, king_col, self.opponent(colour))
+
+        # Restore original board state
+        self.board[from_row][from_col] = piece
+        self.board[to_row][to_col] = captured
+        if ep_square:
+            self.board[ep_square[0]][ep_square[1]] = ep_piece
+        return in_check
+
+    def find_king(self, colour):
+        """Return the (row, col) coordinates of the specified colour's king."""
+        for row in range(8):
+            for col in range(8):
+                piece = self.board[row][col]
+                if piece and piece['piece'] == 'king' and piece['colour'] == colour:
+                    return row, col
+        return None, None
+
+    def is_square_attacked(self, row, col, by_colour):
+        """Return True if any piece belonging to `by_colour` attacks (row, col)."""
+        for r in range(8):
+            for c in range(8):
+                piece = self.board[r][c]
+                if piece and piece['colour'] == by_colour:
+                    if self.can_piece_attack(piece['piece'], r, c, row, col):
+                        return True
+        return False
+
+    def can_piece_attack(self, piece_type, from_row, from_col, to_row, to_col):
+        """Check pseudo-legal attack geometry onto (to_row, to_col)."""
+        if piece_type == 'pawn':
+            piece = self.board[from_row][from_col]
+            direction = -1 if piece['colour'] == 'white' else 1
+            return (to_row - from_row == direction and abs(to_col - from_col) == 1)
+        if piece_type == 'king':
+            return max(abs(to_row - from_row), abs(to_col - from_col)) == 1
+        return self.is_valid_piece_move(piece_type, from_row, from_col, to_row, to_col)
+
+    def apply_move(self, move, promote_to=None):
+        """Mutate board state for a move and return a reversible undo dictionary."""
+        from_row, from_col, to_row, to_col = move
+        piece = self.board[from_row][from_col]
+        kind, colour = piece['piece'], piece['colour']
+        undo = {
+            'move': move,
+            'piece': piece,
+            'captured': self.board[to_row][to_col],
+            'rights': {c: dict(r) for c, r in self.castling_rights.items()},
+            'ep': self.en_passant_target,
+            'rook_move': None,
+            'ep_capture': None,
+        }
+
+        # Handle en-passant pawn removal
+        if (kind == 'pawn' and from_col != to_col and undo['captured'] is None
+                and (to_row, to_col) == self.en_passant_target):
+            undo['ep_capture'] = ((from_row, to_col), self.board[from_row][to_col])
+            self.board[from_row][to_col] = None
+
+        # Relocate corresponding rook during castling
+        if kind == 'king' and abs(to_col - from_col) == 2:
+            rook_from, rook_to = (7, to_col - 1) if to_col > from_col else (0, to_col + 1)
+            self.board[from_row][rook_to] = self.board[from_row][rook_from]
+            self.board[from_row][rook_from] = None
+            undo['rook_move'] = (from_row, rook_from, rook_to)
+
+        self.board[to_row][to_col] = piece
+        self.board[from_row][from_col] = None
+        if promote_to and kind == 'pawn' and to_row in (0, 7):
+            self.board[to_row][to_col] = {'piece': promote_to, 'colour': colour}
+
+        # Revoke castling rights if king moves or corner squares are disturbed
+        if kind == 'king':
+            self.castling_rights[colour]['kingside'] = False
+            self.castling_rights[colour]['queenside'] = False
+        for square in ((from_row, from_col), (to_row, to_col)):
+            if square in CORNER_RIGHTS:
+                side_colour, side = CORNER_RIGHTS[square]
+                self.castling_rights[side_colour][side] = False
+
+        # Set en-passant target square after a two-square pawn push
+        if kind == 'pawn' and abs(to_row - from_row) == 2:
+            self.en_passant_target = ((from_row + to_row) // 2, from_col)
+        else:
+            self.en_passant_target = None
+        return undo
+
+    def undo_move(self, undo):
+        """Restore board state, castling rights, and en-passant target from an undo record."""
+        from_row, from_col, to_row, to_col = undo['move']
+        self.board[from_row][from_col] = undo['piece']
+        self.board[to_row][to_col] = undo['captured']
+        if undo['rook_move']:
+            row, rook_from, rook_to = undo['rook_move']
+            self.board[row][rook_from] = self.board[row][rook_to]
+            self.board[row][rook_to] = None
+        if undo['ep_capture']:
+            (row, col), captured_pawn = undo['ep_capture']
+            self.board[row][col] = captured_pawn
+        self.castling_rights = undo['rights']
+        self.en_passant_target = undo['ep']
+
+    def promote_pawn(self, row, col, new_piece_type):
+        """Replace a promoted pawn on the board and append promotion notation."""
+        piece = self.get_piece_at(row, col)
+        self.board[row][col] = {'piece': new_piece_type, 'colour': piece['colour']}
+        if self.move_history:
+            self.move_history[-1] += '=' + self.PIECE_LETTERS[new_piece_type]
+        self.update_game_state()
+        if self.game_screen:
+            self.game_screen.update_board_display()
+            self.game_screen.check_game_over()
+
+    def promotion(self, row, col, piece_type):
+        """UI callback wrapper for pawn promotion."""
+        self.promote_pawn(row, col, piece_type)
+
+    def show_promotion_popup(self, row, col):
+        """Trigger the UI pawn promotion modal if a screen is attached."""
+        if self.game_screen:
+            self.game_screen.show_promotion_popup(row, col)
+
+    def make_move(self, from_row, from_col, to_row, to_col, promote_to=None):
+        """Validate and commit a move, record notation, switch turns, and check game end."""
+        if self.game_over or not self.is_valid_move(from_row, from_col, to_row, to_col):
+            return False
+
+        piece = self.get_piece_at(from_row, from_col)
+        undo = self.apply_move((from_row, from_col, to_row, to_col), promote_to=promote_to)
+        captured = undo['ep_capture'][1] if undo['ep_capture'] else undo['captured']
+
+        if undo['rook_move']:
+            move_notation = "O-O" if to_col > from_col else "O-O-O"
+        else:
+            move_notation = self.get_move_notation(piece, from_row, from_col, to_row, to_col, captured)
+
+        is_promotion = piece['piece'] == 'pawn' and to_row in (0, 7)
+        if is_promotion and promote_to:
+            move_notation += '=' + self.PIECE_LETTERS[promote_to]
+        self.move_history.append(move_notation)
+
+        if is_promotion and not promote_to:
+            self.show_promotion_popup(to_row, to_col)
+
+        self.current_player = self.opponent(self.current_player)
+        self.update_game_state()
+        return True
+
+    def evaluate_board(self, plies_ahead=0):
+        """Return static board evaluation (+ for White, - for Black)."""
+        score = 0
+        # Age leaf evaluations by search depth to decay early centre-pawn bonuses
+        full_moves = (len(self.move_history) + plies_ahead) / 2
+        centre_bonus = CENTRE_PAWN_B0 * math.exp(-CENTRE_PAWN_K * full_moves)
+
+        for row in range(8):
+            for col in range(8):
+                piece = self.board[row][col]
+                if not piece:
+                    continue
+
+                value = self.PIECE_VALUES[piece['piece']]
+                is_white = piece['colour'] == 'white'
+                score += value if is_white else -value
+
+                # Reward minor pieces developed off their starting rank
+                if piece['piece'] in ('knight', 'bishop'):
+                    if is_white and row < 7:
+                        score += 0.2
+                    elif not is_white and row > 0:
+                        score -= 0.2
+
+                # Reward pawn advancement and exponentially decaying central occupation
+                if piece['piece'] == 'pawn':
+                    score += ((7 - row) * 0.1) if is_white else (-row * 0.1)
+                    weight = CENTRE_WEIGHTS.get((row, col), 0)
+                    if weight:
+                        score += (centre_bonus * weight) if is_white else (-centre_bonus * weight)
+        return score
+
+    def get_all_legal_moves(self, colour):
+        """Generate all legal moves for `colour` using piece-specific rays and offsets."""
+        moves = []
+        original_player = self.current_player
+        self.current_player = colour
+        try:
+            for r in range(8):
+                for c in range(8):
+                    piece = self.board[r][c]
+                    if not piece or piece['colour'] != colour:
+                        continue
+                    kind = piece['piece']
+                    candidates = []
+
+                    if kind == 'pawn':
+                        d = -1 if colour == 'white' else 1
+                        candidates.extend([(r + d, c), (r + 2 * d, c), (r + d, c - 1), (r + d, c + 1)])
+                    elif kind == 'knight':
+                        candidates.extend((r + dr, c + dc) for dr, dc in self.KNIGHT_OFFSETS)
+                    elif kind == 'king':
+                        candidates.extend((r + dr, c + dc) for dr, dc in self.KING_OFFSETS)
+                    else:
+                        # Cast sliding rays until hitting board edge or a blocking piece
+                        dirs = (self.ROOK_DIRS if kind == 'rook' else
+                                self.BISHOP_DIRS if kind == 'bishop' else
+                                self.ROOK_DIRS + self.BISHOP_DIRS)
+                        for dr, dc in dirs:
+                            nr, nc = r + dr, c + dc
+                            while 0 <= nr < 8 and 0 <= nc < 8:
+                                target = self.board[nr][nc]
+                                if target is None:
+                                    candidates.append((nr, nc))
+                                else:
+                                    if target['colour'] != colour:
+                                        candidates.append((nr, nc))
+                                    break
+                                nr += dr
+                                nc += dc
+
+                    for tr, tc in candidates:
+                        if 0 <= tr < 8 and 0 <= tc < 8 and self.is_valid_move(r, c, tr, tc):
+                            moves.append((r, c, tr, tc))
+        finally:
+            self.current_player = original_player
+        return moves
+
+    def score_move(self, move):
+        """Score a candidate move using MVV-LVA and promotion heuristics for move ordering."""
+        from_row, from_col, to_row, to_col = move
+        attacker = self.board[from_row][from_col]
+        victim = self.board[to_row][to_col]
+        score = 0
+
+        # Most Valuable Victim - Least Valuable Attacker capture heuristic
+        if victim:
+            score += 10 * self.PIECE_VALUES[victim['piece']] - self.PIECE_VALUES[attacker['piece']]
+        elif attacker['piece'] == 'pawn' and (to_row, to_col) == self.en_passant_target:
+            score += 9
+
+        if attacker['piece'] == 'pawn' and to_row in (0, 7):
+            score += 80
+
+        if (to_row, to_col) in CENTRE_WEIGHTS:
+            score += 1
+
+        return score
+
+    def minimax(self, depth, maximising_player, alpha=-999999, beta=999999):
+        """Search the game tree with Alpha-Beta pruning and return (best_score, best_move)."""
+        if depth == 0 or self.game_over:
+            return self.evaluate_board(self.root_depth - depth), None
+
+        colour = 'white' if maximising_player else 'black'
+        legal_moves = self.get_all_legal_moves(colour)
+
+        if not legal_moves:
+            king_row, king_col = self.find_king(colour)
+            in_check = (king_row is not None and
+                        self.is_square_attacked(king_row, king_col, self.opponent(colour)))
+            if in_check:
+                # Add remaining depth so faster checkmates receive higher priority
+                mate = MATE_SCORE + depth
+                return (-mate if maximising_player else mate), None
+            return 0, None
+
+        # Order high-impact moves first to trigger early alpha-beta cutoffs
+        legal_moves.sort(key=self.score_move, reverse=True)
+        best_move = None
+
+        if maximising_player:
+            max_eval = -999999
+            for move in legal_moves:
+                undo = self.make_temporary_move(move)
+                eval_score, _ = self.minimax(depth - 1, False, alpha, beta)
+                self.undo_temporary_move(move, undo)
+
+                if eval_score > max_eval:
+                    max_eval = eval_score
+                    best_move = move
+                alpha = max(alpha, eval_score)
+                if beta <= alpha:
+                    break
+            return max_eval, best_move
+        else:
+            min_eval = 999999
+            for move in legal_moves:
+                undo = self.make_temporary_move(move)
+                eval_score, _ = self.minimax(depth - 1, True, alpha, beta)
+                self.undo_temporary_move(move, undo)
+
+                if eval_score < min_eval:
+                    min_eval = eval_score
+                    best_move = move
+                beta = min(beta, eval_score)
+                if beta <= alpha:
+                    break
+            return min_eval, best_move
+
+    def make_temporary_move(self, move):
+        """Apply a search-tree move (auto-promoting pawns to queens) and flip turn."""
+        from_row, from_col, to_row, to_col = move
+        piece = self.board[from_row][from_col]
+        promote_to = 'queen' if (piece['piece'] == 'pawn' and to_row in (0, 7)) else None
+        undo = self.apply_move(move, promote_to=promote_to)
+        self.current_player = self.opponent(self.current_player)
+        return undo
+
+    def undo_temporary_move(self, move, undo):
+        """Revert a search-tree move and restore the previous side to move."""
+        self.undo_move(undo)
+        self.current_player = self.opponent(self.current_player)
+
+    def ai_move(self, depth=4):
+        """Select and execute the best move for Black via Minimax search."""
+        if self.current_player != 'black':
+            return False
+
+        self.root_depth = depth
+        _, best_move = self.minimax(depth, maximising_player=False)
+
+        if best_move is None:
+            self.update_game_state()
+            return False
+
+        from_row, from_col, to_row, to_col = best_move
+        piece = self.get_piece_at(from_row, from_col)
+        promote_to = 'queen' if (piece['piece'] == 'pawn' and to_row in (0, 7)) else None
+        return self.make_move(from_row, from_col, to_row, to_col, promote_to=promote_to)
+
+    def get_move_notation(self, piece, from_row, from_col, to_row, to_col, captured):
+        """Format a move into standard algebraic notation."""
+        files = 'abcdefgh'
+        notation = self.PIECE_LETTERS[piece['piece']]
+        if captured:
+            if piece['piece'] == 'pawn':
+                notation += files[from_col]
+            notation += 'x'
+        notation += files[to_col] + str(8 - to_row)
+        return notation
+
+    def update_game_state(self):
+        """Update check status and detect checkmate or stalemate."""
+        king_row, king_col = self.find_king(self.current_player)
+        self.in_check = (king_row is not None and
+                         self.is_square_attacked(king_row, king_col, self.opponent(self.current_player)))
+        if not self.game_over and not self.has_legal_moves():
+            self.game_over = True
+            if self.in_check:
+                self.winner = self.opponent(self.current_player)
+                self.end_reason = 'checkmate'
+            else:
+                self.winner = 'draw'
+                self.end_reason = 'stalemate'
+
+    def has_legal_moves(self):
+        """Return True if the active player has at least one legal move."""
+        return len(self.get_all_legal_moves(self.current_player)) > 0
+
+
+class HomeScreen(Screen):
+    """Pre-game configuration screen for mode, player names, and clock settings."""
+
+    def __init__(self, **kwargs):
+        """Initialise default AI game settings and construct the setup UI."""
+        super().__init__(**kwargs)
+        self.is_ai_mode = True
+        self.white_name = 'Player 1'
+        self.black_name = 'AI'
+        self.build_ui()
+
+    def build_ui(self):
+        """Assemble the mode toggles, player name inputs, and time control fields."""
+        main_layout = BoxLayout(orientation='vertical', padding=20, spacing=20)
+        title = Label(text='Chess Game', font_size=40, size_hint_y=0.2)
+        main_layout.add_widget(title)
+        form_layout = BoxLayout(orientation='vertical', size_hint_y=0.5, spacing=10)
+        mode_layout = BoxLayout(orientation='horizontal', size_hint_y=0.2, spacing=20)
+
+        self.ai_btn = Button(text='Play vs AI', font_size=20, background_color=(0.2, 0.8, 0.2, 1))
+        self.ai_btn.bind(on_press=self.select_ai_mode)
+        mode_layout.add_widget(self.ai_btn)
+
+        self.two_player_btn = Button(text='2 Player', font_size=20)
+        self.two_player_btn.bind(on_press=self.select_two_player_mode)
+        mode_layout.add_widget(self.two_player_btn)
+        main_layout.add_widget(mode_layout)
+
+        form_layout.add_widget(Label(text='Player 1 Name (White):', size_hint_y=0.2))
+        self.player1_input = TextInput(multiline=False, size_hint_y=0.2, text='Player 1')
+        form_layout.add_widget(self.player1_input)
+
+        self.player2_label = Label(text='Player 2 Name (Black):', size_hint_y=0.2, opacity=0)
+        form_layout.add_widget(self.player2_label)
+        self.player2_input = TextInput(multiline=False, size_hint_y=0.2, text='Player 2', opacity=0, disabled=True)
+        form_layout.add_widget(self.player2_input)
+
+        form_layout.add_widget(Label(text='Time Control (minutes):', size_hint_y=0.2))
+        self.time_input = TextInput(text='10', multiline=False, size_hint_y=0.2)
+        form_layout.add_widget(self.time_input)
+
+        form_layout.add_widget(Label(text='Increment (seconds):', size_hint_y=0.2))
+        self.increment_input = TextInput(text='0', multiline=False, size_hint_y=0.2)
+        form_layout.add_widget(self.increment_input)
+
+        main_layout.add_widget(form_layout)
+        self.start_btn = Button(text='Start Game', font_size=24, size_hint_y=0.1,
+                                background_color=(0.2, 0.8, 0.2, 1))
+        self.start_btn.bind(on_press=self.start_game)
+        main_layout.add_widget(self.start_btn)
+        self.add_widget(main_layout)
+
+    def select_ai_mode(self, instance):
+        """Enable single-player AI mode and hide the Player 2 input field."""
+        self.is_ai_mode = True
+        self.ai_btn.background_color = (0.2, 0.8, 0.2, 1)
+        self.two_player_btn.background_color = (1, 1, 1, 1)
+        self.player2_label.opacity = 0
+        self.player2_input.opacity = 0
+        self.player2_input.disabled = True
+
+    def select_two_player_mode(self, instance):
+        """Enable local two-player mode and reveal the Player 2 input field."""
+        self.is_ai_mode = False
+        self.two_player_btn.background_color = (0.2, 0.8, 0.2, 1)
+        self.ai_btn.background_color = (1, 1, 1, 1)
+        self.player2_label.opacity = 1
+        self.player2_input.opacity = 1
+        self.player2_input.disabled = False
+
+    def start_game(self, instance):
+        """Validate setup form inputs and transition to the active GameScreen."""
+        regex = r'^[a-zA-Z0-9_ ]+$'
+        name1 = self.player1_input.text.strip()
+        name2 = self.player2_input.text.strip()
+        if not name1 or not re.match(regex, name1):
+            self.show_error("Please enter a valid Player 1 name (letters, numbers, spaces, underscores)")
+            return
+        if not self.is_ai_mode and (not name2 or not re.match(regex, name2)):
+            self.show_error("Please enter a valid Player 2 name (letters, numbers, spaces, underscores)")
+            return
+        try:
+            time_control = int(self.time_input.text)
+            increment = int(self.increment_input.text)
+            if time_control <= 0 or increment < 0:
+                raise ValueError
+        except ValueError:
+            self.show_error("Please enter valid positive numbers for time control and increment")
+            return
+
+        self.white_name = name1
+        self.black_name = 'AI' if self.is_ai_mode else name2
+        game_screen = self.manager.get_screen('game')
+        game_screen.initialise_game(
+            self.white_name,
+            self.black_name,
+            self.is_ai_mode,
+            time_control,
+            increment
+        )
+        self.manager.current = 'game'
+
+    def show_error(self, message):
+        """Display a modal error popup with the given message."""
+        popup = Popup(title='Error', content=Label(text=message), size_hint=(0.6, 0.3))
+        popup.open()
+
+
+class GameScreen(Screen):
+    """Interactive chessboard, clock, move history, and AI controller screen."""
+
+    FALLBACK_LETTERS = {'pawn': 'P', 'knight': 'N', 'bishop': 'B', 'rook': 'R', 'queen': 'Q', 'king': 'K'}
+
+    def __init__(self, **kwargs):
+        """Initialise game screen attributes and build the board layout."""
+        super().__init__(**kwargs)
+        self.game = None
+        self.is_ai = False
+        self.selected_square = None
+        self.board_buttons = {}
+        self.timer_event = None
+        self.ai_event = None
+        self.ai_thinking = False
+        self.awaiting_promotion = False
+        self.white_time = 0
+        self.black_time = 0
+        self.increment = 0
+        self.promotion_popup = None
+        self.saved_game_record = False
+        self.player1_name = 'White'
+        self.player2_name = 'Black'
+        self.initial_time_control_minutes = 0
+        self.build_ui()
+
+    def make_file_labels(self):
+        """Create a horizontal row of algebraic file labels (a-h)."""
+        row = BoxLayout(orientation='horizontal', size_hint_y=0.05)
+        row.add_widget(Widget(size_hint_x=0.05))
+        middle = BoxLayout(orientation='horizontal', size_hint_x=0.9)
+        for letter in 'abcdefgh':
+            middle.add_widget(Label(text=letter, font_size=24))
+        row.add_widget(middle)
+        row.add_widget(Widget(size_hint_x=0.05))
+        return row
+
+    def build_ui(self):
+        """Construct the left telemetry sidebar and right 8x8 board container."""
+        main_layout = BoxLayout(orientation='horizontal', padding=10, spacing=20)
+        left_panel = BoxLayout(orientation='vertical', size_hint_x=0.3, spacing=10)
+
+        player1_box = BoxLayout(orientation='vertical', size_hint_y=0.18, spacing=5)
+        self.player1_label = Label(text='Player 1 (White)', font_size=18, bold=True)
+        self.player1_timer = Label(text='10:00', font_size=28, color=(0, 1, 0, 1))
+        player1_box.add_widget(self.player1_label)
+        player1_box.add_widget(self.player1_timer)
+        left_panel.add_widget(player1_box)
+
+        self.turn_indicator = Label(text="White's Turn", font_size=16, bold=True,
+                                    color=(0, 1, 0, 1), size_hint_y=0.08)
+        left_panel.add_widget(self.turn_indicator)
+
+        player2_box = BoxLayout(orientation='vertical', size_hint_y=0.18, spacing=5)
+        self.player2_label = Label(text='AI (Black)', font_size=18, bold=True)
+        self.player2_timer = Label(text='10:00', font_size=28, color=(0, 1, 0, 1))
+        player2_box.add_widget(self.player2_label)
+        player2_box.add_widget(self.player2_timer)
+        left_panel.add_widget(player2_box)
+
+        self.status_label = Label(text='Game in progress', font_size=14,
+                                  size_hint_y=0.08, color=(0, 0.8, 0, 1))
+        left_panel.add_widget(self.status_label)
+
+        move_title = Label(text='Move History:', font_size=20, size_hint_y=0.07, bold=True)
+        left_panel.add_widget(move_title)
+
+        # Lock GridLayout width to ScrollView so move labels clip inside bounds
+        self.move_scroll = ScrollView(size_hint_y=0.28, do_scroll_x=False, bar_width=8)
+        self.move_list = GridLayout(cols=1, size_hint_y=None, size_hint_x=1, spacing=2, padding=[5, 0])
+        self.move_list.bind(minimum_height=self.move_list.setter('height'))
+        self.move_scroll.add_widget(self.move_list)
+        left_panel.add_widget(self.move_scroll)
+
+        controls = BoxLayout(orientation='vertical', size_hint_y=0.13, spacing=5)
+        resign_btn = Button(text='Resign', font_size=20, background_color=(1, 0.3, 0.3, 1))
+        resign_btn.bind(on_press=self.resign_game)
+        controls.add_widget(resign_btn)
+        new_game_btn = Button(text='New Game', font_size=20, background_color=(0.2, 0.8, 0.2, 1))
+        new_game_btn.bind(on_press=self.new_game)
+        controls.add_widget(new_game_btn)
+        left_panel.add_widget(controls)
+
+        main_layout.add_widget(left_panel)
+
+        board_container = BoxLayout(orientation='vertical', size_hint_x=0.7)
+        board_container.add_widget(self.make_file_labels())
+        board_with_ranks = BoxLayout(orientation='horizontal')
+
+        rank_labels = BoxLayout(orientation='vertical', size_hint_x=0.05)
+        for rank in range(8, 0, -1):
+            rank_labels.add_widget(Label(text=str(rank), font_size=24))
+        board_with_ranks.add_widget(rank_labels)
+
+        self.board_layout = GridLayout(cols=8, size_hint_x=0.9, spacing=1)
+        self.create_board()
+        board_with_ranks.add_widget(self.board_layout)
+
+        rank_labels2 = BoxLayout(orientation='vertical', size_hint_x=0.05)
+        for rank in range(8, 0, -1):
+            rank_labels2.add_widget(Label(text=str(rank), font_size=24))
+        board_with_ranks.add_widget(rank_labels2)
+
+        board_container.add_widget(board_with_ranks)
+        board_container.add_widget(self.make_file_labels())
+        main_layout.add_widget(board_container)
+        self.add_widget(main_layout)
+
+    def create_board(self):
+        """Populate the 8x8 GridLayout with alternating light and dark square buttons."""
+        for row in range(8):
+            for col in range(8):
+                is_light = (row + col) % 2 == 0
+                color = (0.95, 0.95, 0.85, 1) if is_light else (0.8, 0.4, 0.2, 1)
+                btn = Button(background_color=color, font_size=40, bold=True)
+                btn.row = row
+                btn.col = col
+                btn.original_color = color
+                btn.bind(on_press=self.on_square_press)
+                self.board_buttons[(row, col)] = btn
+                self.board_layout.add_widget(btn)
+
+    def initialise_game(self, player1_name, player2_name, is_ai, time_control, increment):
+        """Reset timers, events, and ChessGame model for a newly started match."""
+        if self.timer_event:
+            self.timer_event.cancel()
+        if self.ai_event:
+            self.ai_event.cancel()
+            self.ai_event = None
+        if self.promotion_popup:
+            self.promotion_popup.dismiss()
+            self.promotion_popup = None
+
+        self.ai_thinking = False
+        self.awaiting_promotion = False
+        self.game = ChessGame(game_screen=self)
+        self.selected_square = None
+        self.white_time = time_control * 60
+        self.black_time = time_control * 60
+        self.increment = increment
+        self.is_ai = is_ai
+        self.player1_label.text = f'{player1_name} (White)'
+        self.player2_label.text = f'{player2_name} (Black)'
+        self.player1_name = player1_name
+        self.player2_name = player2_name
+        self.initial_time_control_minutes = time_control
+        self.move_list.clear_widgets()
+        self.status_label.color = (0, 0.8, 0, 1)
+        self.update_timer_display()
+        self.timer_event = Clock.schedule_interval(self.update_timer, 1.0)
+        self.status_label.text = 'Game started!'
+        self.saved_game_record = False
+        self.update_board_display()
+        self.update_turn_indicator()
+
+    def show_promotion_popup(self, row, col):
+        """Open a non-dismissible modal prompting the player to pick a promotion piece."""
+        self.awaiting_promotion = True
+        content = BoxLayout(orientation='vertical', spacing=10, padding=10)
+        content.add_widget(Label(text='Promote to:', font_size=18))
+        pieces_layout = BoxLayout(orientation='horizontal', spacing=10)
+        for piece in ['queen', 'rook', 'bishop', 'knight']:
+            btn = Button(text=piece.capitalize(), font_size=16)
+            btn.bind(on_press=lambda instance, p=piece: self.handle_promotion(row, col, p))
+            pieces_layout.add_widget(btn)
+        content.add_widget(pieces_layout)
+        self.promotion_popup = Popup(title='Pawn Promotion', content=content,
+                                     size_hint=(0.6, 0.4), auto_dismiss=False)
+        self.promotion_popup.open()
+
+    def handle_promotion(self, row, col, piece_type):
+        """Apply chosen promotion piece, refresh UI, and trigger AI reply if applicable."""
+        self.promotion_popup.dismiss()
+        self.promotion_popup = None
+        self.awaiting_promotion = False
+        self.game.promotion(row, col, piece_type)
+        self.update_board_display()
+        self.update_move_history()
+        self.update_turn_indicator()
+        self.maybe_start_ai()
+
+    def update_board_display(self):
+        """Sync board button textures (or fallback letters) with the current board array."""
+        for row in range(8):
+            for col in range(8):
+                btn = self.board_buttons[(row, col)]
+                piece = self.game.get_piece_at(row, col)
+                if piece:
+                    piece_image_path = os.path.join(IMAGE_DIR, f"{piece['colour']}-{piece['piece']}.png")
+                    if os.path.exists(piece_image_path):
+                        btn.text = ''
+                        btn.background_normal = piece_image_path
+                    else:
+                        btn.text = self.FALLBACK_LETTERS[piece['piece']]
+                        btn.color = (1, 1, 1, 1) if piece['colour'] == 'white' else (0, 0, 0, 1)
+                        btn.background_normal = ''
+                else:
+                    btn.text = ''
+                    btn.background_normal = ''
+                btn.background_color = btn.original_color
+
+    def select_square(self, row, col):
+        """Highlight (row, col) yellow and store it as the active piece selection."""
+        self.selected_square = (row, col)
+        self.board_buttons[(row, col)].background_color = (1, 1, 0, 1)
+
+    def on_square_press(self, instance):
+        """Handle square clicks for piece selection, re-selection, and move execution."""
+        if not self.game or self.game.game_over or self.awaiting_promotion or self.ai_thinking:
+            return
+        if self.is_ai and self.game.current_player == 'black':
+            return
+
+        row, col = instance.row, instance.col
+        clicked = self.game.get_piece_at(row, col)
+
+        if self.selected_square is None:
+            if clicked and clicked['colour'] == self.game.current_player:
+                self.select_square(row, col)
+            return
+
+        from_row, from_col = self.selected_square
+        if (row, col) == self.selected_square:
+            self.clear_selection()
+            return
+
+        if self.game.make_move(from_row, from_col, row, col):
+            self.clear_selection()
+            # Award Fischer time increment to the side that just completed its move
+            if self.game.current_player == 'black':
+                self.white_time += self.increment
+            else:
+                self.black_time += self.increment
+            self.update_board_display()
+            self.update_move_history()
+            self.update_turn_indicator()
+            self.check_game_over()
+            self.maybe_start_ai()
+        elif clicked and clicked['colour'] == self.game.current_player:
+            self.clear_selection()
+            self.select_square(row, col)
+        else:
+            self.clear_selection()
+
+    def maybe_start_ai(self):
+        """Schedule the AI turn on the next frame if it is Black's turn in AI mode."""
+        if (self.is_ai and self.game and not self.game.game_over
+                and self.game.current_player == 'black' and not self.awaiting_promotion):
+            self.ai_thinking = True
+            self.status_label.text = 'AI is thinking...'
+            self.ai_event = Clock.schedule_once(self.ai_turn, 0.05)
+
+    def ai_turn(self, dt):
+        """Run Minimax search on a background thread to keep the Kivy UI responsive."""
+        self.ai_event = None
+        if not self.game or self.game.game_over or self.game.current_player != 'black':
+            self.ai_thinking = False
+            return
+
+        def worker():
+            moved = self.game.ai_move(depth=4)
+            # Marshal UI updates back onto Kivy's main thread
+            Clock.schedule_once(lambda _dt: self._finish_ai_turn(moved), 0)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_ai_turn(self, moved):
+        """Apply AI move increments, refresh board widgets, and unlock user input."""
+        try:
+            if not self.game:
+                return
+            if moved:
+                self.black_time += self.increment
+            self.update_board_display()
+            self.update_move_history()
+            self.update_turn_indicator()
+            self.update_timer_display()
+            if not self.game.game_over:
+                self.status_label.text = 'Game in progress'
+            self.check_game_over()
+        finally:
+            self.ai_thinking = False
+
+    def clear_selection(self):
+        """Reset the highlighted square colour and clear selection state."""
+        if self.selected_square:
+            row, col = self.selected_square
+            btn = self.board_buttons[(row, col)]
+            btn.background_color = btn.original_color
+        self.selected_square = None
+
+    def update_move_history(self):
+        """Rebuild the scrollable move list with one Label per full move pair."""
+        moves = self.game.move_history
+        self.move_list.clear_widgets()
+        for i in range(0, len(moves), 2):
+            text = f"{i // 2 + 1}. {moves[i]}"
+            if i + 1 < len(moves):
+                text += f"   {moves[i + 1]}"
+            row = Label(
+                text=text,
+                font_size=16,
+                size_hint_y=None,
+                height=24,
+                size_hint_x=1,
+                halign='left',
+                valign='middle',
+            )
+            # Constrain text bounding box to row width for left alignment and clipping
+            row.bind(width=lambda inst, w: setattr(inst, 'text_size', (max(w - 10, 10), inst.height)))
+            self.move_list.add_widget(row)
+        Clock.schedule_once(lambda dt: setattr(self.move_scroll, 'scroll_y', 0), 0.05)
+
+    def update_turn_indicator(self):
+        """Update the status label showing active side, check warning, or winner."""
+        if self.game.game_over:
+            if self.game.winner == 'draw':
+                self.turn_indicator.text = "Draw!"
+                self.turn_indicator.color = (1, 1, 0, 1)
+            else:
+                winner = self.game.winner.capitalize()
+                self.turn_indicator.text = f"{winner} Wins!"
+                self.turn_indicator.color = (0, 1, 0, 1)
+        else:
+            current = self.game.current_player.capitalize()
+            self.turn_indicator.text = f"{current}'s Turn"
+            if self.game.in_check:
+                self.turn_indicator.text += " (Check!)"
+                self.turn_indicator.color = (1, 0, 0, 1)
+            else:
+                self.turn_indicator.color = (0, 1, 0, 1)
+
+    def update_timer(self, dt):
+        """Tick the active player's clock down by 1 second and flag timeouts."""
+        if self.game and not self.game.game_over:
+            if self.game.current_player == 'white':
+                self.white_time -= 1
+                if self.white_time <= 0:
+                    self.white_time = 0
+                    self.game.game_over = True
+                    self.game.winner = 'black'
+                    self.game.end_reason = 'timeout'
+            else:
+                self.black_time -= 1
+                if self.black_time <= 0:
+                    self.black_time = 0
+                    self.game.game_over = True
+                    self.game.winner = 'white'
+                    self.game.end_reason = 'timeout'
+            self.update_timer_display()
+            if self.game.game_over:
+                self.update_turn_indicator()
+                self.check_game_over()
+
+    def update_timer_display(self):
+        """Format remaining clock seconds as M:SS with colour-coded urgency thresholds."""
+        def format_time(seconds):
+            return f"{seconds // 60}:{seconds % 60:02d}"
+
+        self.player1_timer.text = format_time(self.white_time)
+        self.player2_timer.text = format_time(self.black_time)
+        self.player1_timer.color = (1, 0, 0, 1) if self.white_time < 60 else ((1, 1, 0, 1) if self.white_time < 300 else (0, 1, 0, 1))
+        self.player2_timer.color = (1, 0, 0, 1) if self.black_time < 60 else ((1, 1, 0, 1) if self.black_time < 300 else (0, 1, 0, 1))
+
+    def check_game_over(self):
+        """Halt clocks, display the outcome message, and log the match to CSV once."""
+        if self.game.game_over:
+            if self.timer_event:
+                self.timer_event.cancel()
+            reason = self.game.end_reason
+            if self.game.winner == 'draw':
+                self.status_label.text = 'Game drawn by stalemate!'
+            elif self.game.winner:
+                winner = self.game.winner.capitalize()
+                loser = 'White' if winner == 'Black' else 'Black'
+                if reason == 'checkmate':
+                    self.status_label.text = f'Checkmate! {winner} wins!'
+                elif reason == 'timeout':
+                    self.status_label.text = f'{loser} ran out of time! {winner} wins!'
+                elif reason == 'resignation':
+                    self.status_label.text = f'{loser} resigned! {winner} wins!'
+                else:
+                    self.status_label.text = f'{winner} wins!'
+            self.status_label.color = (1, 1, 0, 1)
+            if not self.saved_game_record:
+                self.saved_game_record = True
+                try:
+                    self.save_game_record()
+                except Exception as e:
+                    self.show_error(f"Error saving game record: {e}")
+
+    def show_error(self, message):
+        """Display a modal error popup on the game screen."""
+        popup = Popup(title='Error', content=Label(text=message), size_hint=(0.6, 0.3))
+        popup.open()
+
+    def resign_game(self, instance):
+        """Forfeit the match on behalf of the active player."""
+        if self.game and not self.game.game_over and not self.ai_thinking:
+            current = self.game.current_player
+            self.game.game_over = True
+            self.game.winner = 'black' if current == 'white' else 'white'
+            self.game.end_reason = 'resignation'
+            self.update_turn_indicator()
+            self.check_game_over()
+
+    def save_game_record(self):
+        """Append completed match metadata and move history to chessgame.csv."""
+        csv_path = os.path.join(BASE_DIR, 'chessgame.csv')
+        header = [
+            'timestamp_utc', 'white_player', 'black_player',
+            'start_time_minutes', 'increment_seconds', 'is_ai',
+            'result', 'moves', 'white_time_remaining_seconds',
+            'black_time_remaining_seconds', 'total_moves'
+        ]
+        timestamp = datetime.now(timezone.utc).isoformat()
+        if self.game.winner == 'draw':
+            result = 'draw'
+        elif self.game.winner:
+            winner_name = self.player1_name if self.game.winner == 'white' else self.player2_name
+            result = f"{winner_name} ({self.game.winner})"
+        else:
+            result = 'unknown'
+
+        row = [
+            timestamp, self.player1_name, self.player2_name,
+            str(self.initial_time_control_minutes), str(self.increment),
+            str(bool(self.is_ai)), result, ' | '.join(self.game.move_history),
+            str(int(self.white_time)), str(int(self.black_time)),
+            str(len(self.game.move_history))
+        ]
+        write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
+        with open(csv_path, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(header)
+            writer.writerow(row)
+
+    def new_game(self, instance):
+        """Cancel active clocks/events and return to the setup screen."""
+        if self.timer_event:
+            self.timer_event.cancel()
+        if self.ai_event:
+            self.ai_event.cancel()
+            self.ai_event = None
+        self.ai_thinking = False
+        if self.promotion_popup:
+            self.promotion_popup.dismiss()
+            self.promotion_popup = None
+        self.awaiting_promotion = False
+        self.manager.current = 'home'
+
+    def quit_game(self, instance):
+        """Terminate the Kivy application."""
+        App.get_running_app().stop()
+
+
+class ChessApp(App):
+    """Root Kivy application managing screen navigation."""
+
+    def build(self):
+        """Instantiate and register the HomeScreen and GameScreen."""
+        self.title = 'Chess Game'
+        Window.clearcolor = (0.1, 0.1, 0.1, 1)
+        sm = ScreenManager()
+        sm.add_widget(HomeScreen(name='home'))
+        sm.add_widget(GameScreen(name='game'))
+        return sm
+
+
+def main():
+    """Application entry point."""
+    ChessApp().run()
+
+
+if __name__ == '__main__':
+    main()
