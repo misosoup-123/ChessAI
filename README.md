@@ -4,7 +4,7 @@ A desktop chess application and AI engine built from scratch in Python using Kiv
 
 ## Technical Highlights
 
-* **Alpha-Beta Search & Move Ordering:** Implements Minimax (`depth=4`) with Alpha-Beta pruning, Most Valuable Victim – Least Valuable Attacker (MVV-LVA) capture sorting, promotion prioritisation, and depth-aged checkmate scoring (`MATE_SCORE + depth`) to favour faster mates.
+* **Alpha-Beta Search & Move Ordering:** Implements Minimax (`depth=5`) with Alpha-Beta pruning, Most Valuable Victim – Least Valuable Attacker (MVV-LVA) capture sorting, promotion prioritisation, and depth-aged checkmate scoring (`MATE_SCORE + depth`) to favour faster mates.
 * **Zero-Allocation Tree Traversal:** Mutates board state in place (`apply_move` / `undo_move`) using reversible state records—restoring castling rights, rook coordinates, and en-passant targets without `deepcopy` overhead—paired with piece-specific ray and offset move generation.
 * **Differential-Equation Positional Evaluation:** Evaluates board states using material balance, minor-piece development bonuses, pawn advancement, and a central-control term ($d4, e4, d5, e5$ and the surrounding ring) modelled via exponential decay:
   $$B(n) = B_0 e^{-kn}$$
